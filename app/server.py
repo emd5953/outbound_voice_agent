@@ -7,7 +7,7 @@ import json
 import logging
 from typing import Any
 
-from deepgram import AsyncDeepgramClient
+import websockets as ws_lib
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from pydantic import ValidationError
 from twilio.rest import Client as TwilioClient
@@ -16,6 +16,7 @@ from app.call_orchestrator import CallOrchestrator
 from app.conversation_engine import ConversationEngine
 from app.media_handler import MediaStreamHandler
 from app.models import CallResult, OrderContext, OrderPayload
+from app.state_machine import CallState
 from app.utils import extract_zip_code
 from config import (
     BASE_URL,
@@ -26,6 +27,7 @@ from config import (
     TWILIO_FROM_NUMBER,
 )
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Pizza Order Voice Agent")
@@ -34,41 +36,11 @@ app = FastAPI(title="Pizza Order Voice Agent")
 active_calls: dict[str, CallOrchestrator] = {}
 
 
-class DeepgramSocketAdapter:
-    """Thin adapter wrapping the Deepgram SDK's AsyncV1SocketClient.
-
-    MediaStreamHandler expects a WebSocket-like object with:
-    - ``send(bytes)`` to forward audio
-    - ``async for message in ws`` yielding JSON strings
-
-    The Deepgram SDK uses ``send_media(bytes)`` and ``recv()`` returning
-    typed Pydantic objects.  This adapter bridges the two interfaces.
-    """
-
-    def __init__(self, dg_socket: Any) -> None:
-        self._socket = dg_socket
-
-    async def send(self, data: bytes) -> None:
-        """Forward raw audio bytes to Deepgram."""
-        await self._socket.send_media(data)
-
-    def __aiter__(self) -> DeepgramSocketAdapter:
-        return self
-
-    async def __anext__(self) -> str:
-        """Yield the next Deepgram message as a JSON string."""
-        try:
-            result = await self._socket.recv()
-            # Convert Pydantic model to JSON string for MediaStreamHandler
-            if hasattr(result, "model_dump_json"):
-                return result.model_dump_json()
-            if hasattr(result, "json"):
-                return result.json()
-            return json.dumps(result)
-        except StopAsyncIteration:
-            raise
-        except Exception:
-            raise StopAsyncIteration
+DEEPGRAM_WS_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    "?encoding=mulaw&sample_rate=8000&channels=1"
+    "&model=nova-2&punctuate=true&interim_results=true"
+)
 
 
 @app.post("/place-order", response_model=CallResult)
@@ -98,6 +70,7 @@ async def place_order(payload: OrderPayload) -> CallResult:
 
     # Create the call orchestrator
     orchestrator = CallOrchestrator(order=payload, context=context)
+    orchestrator.state = CallState.IVR_WELCOME  # Ready for first IVR prompt
 
     # Initiate Twilio outbound call
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -213,7 +186,7 @@ async def media_stream(websocket: WebSocket) -> None:
 
     call_sid: str = ""
     orchestrator: CallOrchestrator | None = None
-    dg_connection: Any = None
+    deepgram_ws: Any = None
 
     try:
         # ---- Phase 1: Wait for Twilio 'start' event ----
@@ -243,19 +216,11 @@ async def media_stream(websocket: WebSocket) -> None:
                 orchestrator.stream_sid = stream_sid
                 break
 
-        # ---- Phase 2: Connect to Deepgram STT ----
-        dg_client = AsyncDeepgramClient(api_key=DEEPGRAM_API_KEY)
-        dg_connection = dg_client.listen.v1.connect(
-            model="nova-2",
-            encoding="mulaw",
-            sample_rate=8000,
-            channels=1,
-            interim_results=True,
-            punctuate=True,
+        # ---- Phase 2: Connect to Deepgram STT via raw WebSocket ----
+        extra_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+        deepgram_ws = await ws_lib.connect(
+            DEEPGRAM_WS_URL, additional_headers=extra_headers
         )
-        # The connect() call returns an async context manager
-        dg_socket = await dg_connection.__aenter__()
-        deepgram_ws = DeepgramSocketAdapter(dg_socket)
 
         # ---- Phase 3: Wire components together ----
         handler = MediaStreamHandler(
@@ -284,9 +249,9 @@ async def media_stream(websocket: WebSocket) -> None:
             await orchestrator.end_call("ivr_failure")
     finally:
         # ---- Phase 5: Cleanup ----
-        if dg_connection is not None:
+        if deepgram_ws is not None:
             try:
-                await dg_connection.__aexit__(None, None, None)
+                await deepgram_ws.close()
             except Exception:
                 logger.debug("Deepgram connection already closed")
         logger.info("WebSocket /media-stream closed: call_sid=%s", call_sid)

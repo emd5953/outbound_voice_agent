@@ -1,0 +1,24 @@
+{
+  "customer_name": "Jordan Mitchell",
+  "phone_number": "5125550147",
+  "delivery_address": "4821 Elm Street, Apt 3B, Austin, TX 78745",
+  "pizza": {
+    "size": "large",
+    "crust": "thin",
+    "toppings": ["pepperoni", "mushroom", "green pepper"],
+    "acceptable_topping_subs": ["sausage", "bacon", "onion", "spinach", "jalapeño"],
+    "no_go_toppings": ["olives", "anchovies", "pineapple"]
+  },
+  "side": {
+    "first_choice": "buffalo wings, 12 count",
+    "backup_options": ["garlic bread", "breadsticks", "mozzarella sticks"],
+    "if_all_unavailable": "skip"
+  },
+  "drink": {
+    "first_choice": "2L Coke",
+    "alternatives": ["2L Pepsi", "2L Sprite"],
+    "skip_if_over_budget": true
+  },
+  "budget_max": 45.00,
+  "special_instructions": "Ring doorbell, do not knock (baby sleeping)"
+}

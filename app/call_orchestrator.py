@@ -330,17 +330,76 @@ class CallOrchestrator:
     # ------------------------------------------------------------------
 
     async def send_dtmf(self, digits: str) -> None:
-        """Send DTMF tones via the Twilio REST API.
+        """Send DTMF tones through the audio stream.
 
-        Uses the Twilio client to play DTMF digits on the active call.
+        Generates DTMF tone audio and sends it through the Twilio WebSocket
+        media stream. This avoids updating the call's TwiML which would
+        kill the bidirectional stream.
         """
+        import audioop
+        import math
+        import struct
+
         logger.info("Sending DTMF: %s", digits)
         self.transcript_history.append({"role": "agent", "text": f"[DTMF: {digits}]"})
 
-        if self.call_sid and self._twilio_client is not None:
-            self._twilio_client.calls(self.call_sid).update(
-                twiml=f"<Response><Play digits='{digits}'/></Response>"
-            )
+        if self._media_handler is None:
+            return
+
+        # DTMF frequency pairs
+        DTMF_FREQS = {
+            "1": (697, 1209), "2": (697, 1336), "3": (697, 1477),
+            "4": (770, 1209), "5": (770, 1336), "6": (770, 1477),
+            "7": (852, 1209), "8": (852, 1336), "9": (852, 1477),
+            "0": (941, 1336), "*": (941, 1209), "#": (941, 1477),
+        }
+
+        sample_rate = 8000
+        tone_duration = 0.15  # seconds per digit
+        gap_duration = 0.05   # gap between digits
+
+        import base64
+        import json
+
+        for digit in digits:
+            freqs = DTMF_FREQS.get(digit)
+            if freqs is None:
+                continue
+
+            f1, f2 = freqs
+            num_samples = int(sample_rate * tone_duration)
+            samples = []
+            for i in range(num_samples):
+                t = i / sample_rate
+                val = 0.5 * (math.sin(2 * math.pi * f1 * t) + math.sin(2 * math.pi * f2 * t))
+                # Convert to 16-bit PCM
+                samples.append(int(val * 16383))
+
+            # Pack as 16-bit linear PCM
+            pcm_data = struct.pack(f"<{len(samples)}h", *samples)
+            # Convert to mulaw
+            mulaw_data = audioop.lin2ulaw(pcm_data, 2)
+
+            # Send as base64 media event
+            audio_b64 = base64.b64encode(mulaw_data).decode("utf-8")
+            media_event = json.dumps({
+                "event": "media",
+                "streamSid": self._media_handler.stream_sid,
+                "media": {"payload": audio_b64},
+            })
+            await self._media_handler.twilio_ws.send_text(media_event)
+
+            # Gap between digits
+            if gap_duration > 0:
+                gap_samples = int(sample_rate * gap_duration)
+                silence = audioop.lin2ulaw(b"\x00\x00" * gap_samples, 2)
+                gap_b64 = base64.b64encode(silence).decode("utf-8")
+                gap_event = json.dumps({
+                    "event": "media",
+                    "streamSid": self._media_handler.stream_sid,
+                    "media": {"payload": gap_b64},
+                })
+                await self._media_handler.twilio_ws.send_text(gap_event)
 
     async def speak(self, text: str) -> None:
         """Synthesize text via Cartesia TTS and send audio to Twilio.

@@ -75,19 +75,21 @@ class MediaStreamHandler:
             logger.info("Twilio media stream stopped – streamSid=%s", self.stream_sid)
 
     async def forward_audio_to_deepgram(self) -> None:
-        """Continuously read Twilio WebSocket messages and forward audio.
-
-        Runs as a long-lived coroutine.  Iterates over incoming Twilio
-        messages, delegating each to :meth:`handle_twilio_message`.  Exits
-        when a ``"stop"`` event is received or the WebSocket closes.
-        """
-        async for message in self.twilio_ws:
-            data: dict = json.loads(message) if isinstance(message, (str, bytes)) else message
-            await self.handle_twilio_message(
-                message if isinstance(message, (str, bytes)) else json.dumps(message)
-            )
-            if data.get("event") == "stop":
-                break
+        """Continuously read Twilio WebSocket messages and forward audio."""
+        audio_count = 0
+        try:
+            while True:
+                message = await self.twilio_ws.receive_text()
+                data: dict = json.loads(message)
+                await self.handle_twilio_message(message)
+                if data.get("event") == "media":
+                    audio_count += 1
+                    if audio_count % 100 == 1:
+                        logger.info("Audio chunks forwarded to Deepgram: %d", audio_count)
+                if data.get("event") == "stop":
+                    break
+        except Exception as exc:
+            logger.info("forward_audio_to_deepgram ended: %s", exc)
 
     # ------------------------------------------------------------------
     # Deepgram → Orchestrator: transcript processing
@@ -111,16 +113,36 @@ class MediaStreamHandler:
 
         transcript = transcript.strip()
         if transcript:
+            logger.info("Deepgram transcript (is_final): %s", transcript)
             await self.call_orchestrator.handle_transcript(transcript)
 
     async def process_deepgram_transcripts(self) -> None:
-        """Continuously read Deepgram WebSocket messages and process transcripts.
-
-        Runs as a long-lived coroutine.  Iterates over incoming Deepgram
-        messages and delegates each to :meth:`handle_deepgram_transcript`.
-        """
-        async for message in self.deepgram_ws:
-            await self.handle_deepgram_transcript(message)
+        """Continuously read Deepgram WebSocket messages and process transcripts."""
+        try:
+            while True:
+                message = await self.deepgram_ws.recv()
+                # Debug: log raw Deepgram messages
+                try:
+                    parsed = json.loads(message)
+                    msg_type = parsed.get("type", "unknown")
+                    if msg_type == "Results":
+                        is_final = parsed.get("is_final", False)
+                        transcript = ""
+                        try:
+                            transcript = parsed["channel"]["alternatives"][0]["transcript"]
+                        except (KeyError, IndexError):
+                            pass
+                        logger.info(
+                            "Deepgram raw: type=%s is_final=%s transcript='%s'",
+                            msg_type, is_final, transcript[:100],
+                        )
+                    else:
+                        logger.info("Deepgram msg type=%s", msg_type)
+                except Exception:
+                    logger.info("Deepgram raw (unparsed): %s", str(message)[:200])
+                await self.handle_deepgram_transcript(message)
+        except Exception as exc:
+            logger.info("process_deepgram_transcripts ended: %s", exc)
 
 
 # ------------------------------------------------------------------

@@ -68,28 +68,33 @@ async def handle_ivr_transcript(
         return
 
     # --- State-specific prompt matching ---
+    # Deepgram may transcribe digits as words ("one" not "1") and may
+    # split a single IVR prompt across multiple transcript chunks.
     if state == CallState.IVR_WELCOME:
-        if "press 1 for delivery" in text:
+        if ("press 1" in text or "press one" in text) and "delivery" in text:
+            await orchestrator.send_dtmf("1")
+            orchestrator.state = CallState.IVR_NAME
+        elif "delivery" in text and ("1" in text or "one" in text):
             await orchestrator.send_dtmf("1")
             orchestrator.state = CallState.IVR_NAME
 
     elif state == CallState.IVR_NAME:
-        if "say the name" in text:
+        if "name" in text and ("say" in text or "order" in text):
             await orchestrator.speak(order.customer_name)
             orchestrator.state = CallState.IVR_CALLBACK
 
     elif state == CallState.IVR_CALLBACK:
-        if "callback number" in text:
+        if "callback" in text or "phone number" in text or "digit" in text:
             await orchestrator.send_dtmf(order.phone_number)
             orchestrator.state = CallState.IVR_ZIPCODE
 
     elif state == CallState.IVR_ZIPCODE:
-        if "zip code" in text:
+        if "zip" in text:
             zip_code = extract_zip_code(order.delivery_address)
             await orchestrator.speak(zip_code)
             orchestrator.state = CallState.IVR_CONFIRM
 
     elif state == CallState.IVR_CONFIRM:
-        if "is that correct" in text:
+        if "correct" in text or "is that right" in text:
             await orchestrator.speak("yes")
             orchestrator.state = CallState.ON_HOLD

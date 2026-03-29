@@ -162,18 +162,9 @@ class TestForwardAudioLoop:
 
         deepgram_ws = AsyncMock()
 
-        # Make twilio_ws async-iterable over the messages list
+        # forward_audio_to_deepgram uses receive_text() in a while loop
         twilio_ws = AsyncMock()
-        twilio_ws.__aiter__ = lambda self: self
-        twilio_ws._iter = iter(messages)
-
-        async def _anext(self):
-            try:
-                return next(self._iter)
-            except StopIteration:
-                raise StopAsyncIteration
-
-        twilio_ws.__anext__ = _anext
+        twilio_ws.receive_text = AsyncMock(side_effect=messages)
 
         handler = _make_handler(twilio_ws=twilio_ws, deepgram_ws=deepgram_ws)
         await handler.forward_audio_to_deepgram()
@@ -198,17 +189,11 @@ class TestProcessDeepgramLoop:
 
         orchestrator = AsyncMock()
 
+        # process_deepgram_transcripts uses recv() in a while loop
         deepgram_ws = AsyncMock()
-        deepgram_ws.__aiter__ = lambda self: self
-        deepgram_ws._iter = iter(messages)
-
-        async def _anext(self):
-            try:
-                return next(self._iter)
-            except StopIteration:
-                raise StopAsyncIteration
-
-        deepgram_ws.__anext__ = _anext
+        deepgram_ws.recv = AsyncMock(
+            side_effect=[*messages, Exception("connection closed")]
+        )
 
         handler = _make_handler(deepgram_ws=deepgram_ws, orchestrator=orchestrator)
         await handler.process_deepgram_transcripts()
