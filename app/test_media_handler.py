@@ -214,3 +214,146 @@ class TestProcessDeepgramLoop:
         await handler.process_deepgram_transcripts()
 
         orchestrator.handle_transcript.assert_awaited_once_with("what can I get you")
+
+
+# ---------------------------------------------------------------------------
+# synthesize_and_send tests (task 7.2)
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch, MagicMock
+
+from app.media_handler import synthesize_and_send, TTSError
+
+
+class _FakeResponse:
+    """Mimics an AsyncBinaryAPIResponse with async iter_bytes."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def iter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class TestSynthesizeAndSend:
+    @pytest.mark.asyncio
+    async def test_streams_audio_chunks_as_base64_media_events(self):
+        """Happy path: audio chunks are base64-encoded and sent to Twilio."""
+        chunks = [b"\x01\x02", b"\x03\x04"]
+        fake_response = _FakeResponse(chunks)
+
+        mock_client = AsyncMock()
+        mock_client.tts.generate = AsyncMock(return_value=fake_response)
+        mock_client.close = AsyncMock()
+
+        twilio_ws = AsyncMock()
+
+        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+            await synthesize_and_send("hello", "STREAM1", twilio_ws)
+
+        # Verify generate was called with correct params
+        mock_client.tts.generate.assert_awaited_once()
+        call_kwargs = mock_client.tts.generate.call_args.kwargs
+        assert call_kwargs["transcript"] == "hello"
+        assert call_kwargs["output_format"]["encoding"] == "pcm_mulaw"
+        assert call_kwargs["output_format"]["sample_rate"] == 8000
+        assert call_kwargs["voice"] == {"mode": "id", "id": "a0e99841-438c-4a64-b679-ae501e7d6091"}
+
+        # Verify each chunk was sent as a media event
+        assert twilio_ws.send_text.await_count == 2
+        for i, chunk in enumerate(chunks):
+            sent_json = json.loads(twilio_ws.send_text.call_args_list[i].args[0])
+            assert sent_json["event"] == "media"
+            assert sent_json["streamSid"] == "STREAM1"
+            expected_b64 = base64.b64encode(chunk).decode("utf-8")
+            assert sent_json["media"]["payload"] == expected_b64
+
+    @pytest.mark.asyncio
+    async def test_retries_once_on_first_failure(self):
+        """First TTS call fails, second succeeds — should still work."""
+        fake_response = _FakeResponse([b"\xaa"])
+
+        mock_client_fail = AsyncMock()
+        mock_client_fail.tts.generate = AsyncMock(side_effect=RuntimeError("API down"))
+        mock_client_fail.close = AsyncMock()
+
+        mock_client_ok = AsyncMock()
+        mock_client_ok.tts.generate = AsyncMock(return_value=fake_response)
+        mock_client_ok.close = AsyncMock()
+
+        twilio_ws = AsyncMock()
+
+        with patch("app.media_handler.cartesia.AsyncCartesia", side_effect=[mock_client_fail, mock_client_ok]):
+            with patch("app.media_handler.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                await synthesize_and_send("retry me", "SID2", twilio_ws)
+
+        # Sleep was called once (backoff before retry)
+        mock_sleep.assert_awaited_once_with(1.0)
+        # Audio was sent on the second attempt
+        assert twilio_ws.send_text.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_raises_tts_error_after_two_failures(self):
+        """Both attempts fail — should raise TTSError."""
+        mock_client = AsyncMock()
+        mock_client.tts.generate = AsyncMock(side_effect=RuntimeError("API down"))
+        mock_client.close = AsyncMock()
+
+        twilio_ws = AsyncMock()
+
+        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+            with patch("app.media_handler.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(TTSError, match="failed after 2 attempts"):
+                    await synthesize_and_send("fail me", "SID3", twilio_ws)
+
+        # No audio should have been sent
+        twilio_ws.send_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_client_closed_on_success(self):
+        """Client is closed after successful synthesis."""
+        fake_response = _FakeResponse([b"\x00"])
+        mock_client = AsyncMock()
+        mock_client.tts.generate = AsyncMock(return_value=fake_response)
+        mock_client.close = AsyncMock()
+
+        twilio_ws = AsyncMock()
+
+        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+            await synthesize_and_send("hi", "SID4", twilio_ws)
+
+        mock_client.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_client_closed_on_failure(self):
+        """Client is closed even when TTS fails."""
+        mock_client = AsyncMock()
+        mock_client.tts.generate = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_client.close = AsyncMock()
+
+        twilio_ws = AsyncMock()
+
+        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+            with patch("app.media_handler.asyncio.sleep", new_callable=AsyncMock):
+                with pytest.raises(TTSError):
+                    await synthesize_and_send("bye", "SID5", twilio_ws)
+
+        # close() called on each attempt
+        assert mock_client.close.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_custom_voice_id_passed_through(self):
+        """A custom voice_id is forwarded to the Cartesia API."""
+        fake_response = _FakeResponse([b"\x00"])
+        mock_client = AsyncMock()
+        mock_client.tts.generate = AsyncMock(return_value=fake_response)
+        mock_client.close = AsyncMock()
+
+        twilio_ws = AsyncMock()
+
+        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+            await synthesize_and_send("test", "SID6", twilio_ws, voice_id="custom-voice-123")
+
+        call_kwargs = mock_client.tts.generate.call_args.kwargs
+        assert call_kwargs["voice"] == {"mode": "id", "id": "custom-voice-123"}
