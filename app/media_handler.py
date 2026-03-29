@@ -156,37 +156,49 @@ async def synthesize_and_send(
     twilio_ws: Any,
     voice_id: str = CARTESIA_VOICE_ID,
 ) -> None:
-    """Synthesize *text* via Cartesia TTS and stream audio to Twilio.
+    """Synthesize *text* via Cartesia TTS HTTP API and stream audio to Twilio.
 
-    Audio is requested as raw pcm_mulaw at 8 kHz (Twilio's native format),
-    then each chunk is base64-encoded and sent as a Twilio ``media`` event.
+    Uses the Cartesia REST API directly (bypassing the SDK which has Python 3.9
+    compatibility issues) to generate raw pcm_mulaw at 8 kHz, then sends each
+    chunk as a base64-encoded Twilio media event.
 
-    Retry logic (Requirements 16.1, 16.2):
+    Retry logic:
     - On first TTS failure, retry once after a 1-second backoff.
-    - On second failure, raise :class:`TTSError` so the caller can end the
-      call gracefully and return partial results.
+    - On second failure, raise TTSError.
     """
-    output_format = {
-        "container": "raw",
-        "encoding": "pcm_mulaw",
-        "sample_rate": 8000,
-    }
+    import httpx
 
     max_attempts = 2
-    backoff = 1.0  # seconds before retry
+    backoff = 1.0
 
     for attempt in range(1, max_attempts + 1):
         try:
-            client = cartesia.AsyncCartesia(api_key=CARTESIA_API_KEY)
-            try:
-                response = await client.tts.generate(
-                    model_id=CARTESIA_MODEL_ID,
-                    transcript=text,
-                    voice={"mode": "id", "id": voice_id},
-                    output_format=output_format,
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                response = await http_client.post(
+                    "https://api.cartesia.ai/tts/bytes",
+                    headers={
+                        "X-API-Key": CARTESIA_API_KEY,
+                        "Cartesia-Version": "2024-06-10",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model_id": CARTESIA_MODEL_ID,
+                        "transcript": text,
+                        "voice": {"mode": "id", "id": voice_id},
+                        "output_format": {
+                            "container": "raw",
+                            "encoding": "pcm_mulaw",
+                            "sample_rate": 8000,
+                        },
+                    },
                 )
+                response.raise_for_status()
 
-                async for chunk in response.iter_bytes():
+                audio_bytes = response.content
+                # Send in chunks to avoid huge single frames
+                chunk_size = 640  # 80ms of mulaw at 8kHz
+                for i in range(0, len(audio_bytes), chunk_size):
+                    chunk = audio_bytes[i : i + chunk_size]
                     audio_b64 = base64.b64encode(chunk).decode("utf-8")
                     media_event = json.dumps(
                         {
@@ -196,10 +208,7 @@ async def synthesize_and_send(
                         }
                     )
                     await twilio_ws.send_text(media_event)
-            finally:
-                await client.close()
 
-            # Success — exit the retry loop
             return
 
         except Exception as exc:
@@ -211,7 +220,7 @@ async def synthesize_and_send(
                     backoff,
                 )
                 await asyncio.sleep(backoff)
-                backoff *= 2  # exponential backoff for future retries
+                backoff *= 2
             else:
                 logger.error(
                     "Cartesia TTS failed after %d attempts: %s",

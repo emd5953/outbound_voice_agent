@@ -49,6 +49,11 @@ class CallOrchestrator:
         self._conversation_engine: Optional[ConversationEngine] = None
         self._twilio_client: Any = None
 
+        # Debounce: accumulate transcripts before responding
+        self._pending_transcript: str = ""
+        self._debounce_task: Optional[asyncio.Task] = None
+        self._DEBOUNCE_SECONDS: float = 1.5  # wait for employee to finish
+
         # Twilio call metadata
         self.call_sid: str = ""
         self.stream_sid: str = ""
@@ -80,25 +85,56 @@ class CallOrchestrator:
     async def handle_transcript(self, text: str) -> None:
         """Route an incoming transcript based on the current call state.
 
-        - IVR states → deterministic IVR handler
+        - IVR states → deterministic IVR handler (no debounce)
         - ON_HOLD   → hold-end detection
-        - CONVERSATION → conversation handler (LLM-driven)
+        - CONVERSATION → debounced: accumulate text, wait for silence, then process
         """
-        # Record every employee utterance in chronological order
-        self.transcript_history.append({"role": "employee", "text": text})
-
         if self.state in _IVR_STATES:
+            # IVR needs immediate responses — no debounce
+            self.transcript_history.append({"role": "employee", "text": text})
             await handle_ivr_transcript(self, text)
 
         elif self.state == CallState.ON_HOLD:
+            self.transcript_history.append({"role": "employee", "text": text})
             if detect_hold_end(text):
                 logger.info("Human detected — transitioning to CONVERSATION")
                 self.state = CallState.CONVERSATION
-                # Let the conversation handler process the greeting
-                await self.handle_conversation(text)
+                await self._debounced_conversation(text)
 
         elif self.state == CallState.CONVERSATION:
-            await self.handle_conversation(text)
+            await self._debounced_conversation(text)
+
+    async def _debounced_conversation(self, text: str) -> None:
+        """Accumulate transcript text and wait for a pause before responding.
+        
+        This prevents the agent from cutting off the employee mid-sentence
+        when Deepgram sends multiple is_final chunks for one utterance.
+        """
+        if text.strip():
+            if self._pending_transcript:
+                self._pending_transcript += " " + text.strip()
+            else:
+                self._pending_transcript = text.strip()
+
+        # Cancel any existing debounce timer
+        if self._debounce_task is not None and not self._debounce_task.done():
+            self._debounce_task.cancel()
+
+        # Start a new timer
+        self._debounce_task = asyncio.create_task(self._debounce_fire())
+
+    async def _debounce_fire(self) -> None:
+        """Wait for silence, then process the accumulated transcript."""
+        await asyncio.sleep(self._DEBOUNCE_SECONDS)
+        
+        transcript = self._pending_transcript.strip()
+        self._pending_transcript = ""
+        
+        if not transcript:
+            return
+        
+        self.transcript_history.append({"role": "employee", "text": transcript})
+        await self.handle_conversation(transcript)
 
     # ------------------------------------------------------------------
     # Conversation handler (stub — implemented in task 9.2)
@@ -288,17 +324,37 @@ class CallOrchestrator:
     # ------------------------------------------------------------------
 
     async def maybe_advance_phase(self) -> None:
-        """Transition to the next conversation phase when conditions are met."""
+        """Transition to the next conversation phase when conditions are met.
+        
+        GREETING and DELIVERY_INFO advance based on transcript count to avoid
+        jumping ahead before the employee has asked for info.
+        """
         phase = self.conversation_phase
         ctx = self.context
 
+        # Count how many employee utterances we've had in conversation
+        conv_count = sum(
+            1 for e in self.transcript_history
+            if e["role"] == "employee" and e.get("text", "").strip()
+        )
+
         if phase == ConversationPhase.GREETING:
-            # After initial greeting exchange, move to delivery info
-            self.conversation_phase = ConversationPhase.DELIVERY_INFO
+            # Stay in greeting for the first exchange, then move to delivery info
+            if conv_count >= 2:
+                self.conversation_phase = ConversationPhase.DELIVERY_INFO
 
         elif phase == ConversationPhase.DELIVERY_INFO:
-            # After delivery info provided, move to pizza order
-            self.conversation_phase = ConversationPhase.PIZZA_ORDER
+            # Stay in delivery info until the employee asks about the order
+            # (indicated by enough back-and-forth or keywords)
+            last_employee = ""
+            for e in reversed(self.transcript_history):
+                if e["role"] == "employee" and e.get("text", "").strip():
+                    last_employee = e["text"].lower()
+                    break
+            order_keywords = ["order", "what can i get", "what would you like",
+                              "what are you looking", "what do you want", "looking to order"]
+            if any(kw in last_employee for kw in order_keywords) or conv_count >= 6:
+                self.conversation_phase = ConversationPhase.PIZZA_ORDER
 
         elif phase == ConversationPhase.PIZZA_ORDER and ctx.pizza_price is not None:
             self.conversation_phase = ConversationPhase.SIDE_ORDER

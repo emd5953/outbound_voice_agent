@@ -154,7 +154,11 @@ async def twilio_status(request: Request) -> Response:
     if call_status in ("completed", "failed", "busy", "no-answer", "canceled"):
         orchestrator = active_calls.get(call_sid)
         if orchestrator is not None and orchestrator.state.value != "hangup":
-            await orchestrator.end_call("ivr_failure")
+            # Call ended externally — use whatever phase we're in to determine outcome
+            if orchestrator.state == CallState.CONVERSATION:
+                await orchestrator.end_call("completed")
+            else:
+                await orchestrator.end_call("ivr_failure")
 
     return Response(content="<Response/>", media_type="application/xml")
 

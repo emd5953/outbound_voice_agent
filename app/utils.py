@@ -125,7 +125,10 @@ def detect_hold_end(transcript: str) -> bool:
 
 
 def extract_price(text: str) -> Optional[float]:
-    """Extract a price from text, matching $XX.XX or XX.XX patterns.
+    """Extract a price from text, matching $XX.XX, XX.XX, or word-form prices.
+
+    Handles both digit patterns ("$18.50", "18.50") and word-form prices
+    from STT transcription ("eighteen fifty", "twenty eight ninety eight").
 
     Args:
         text: Raw text that may contain a price (e.g., employee speech transcript).
@@ -133,7 +136,87 @@ def extract_price(text: str) -> Optional[float]:
     Returns:
         The numeric float value of the first price found, or None if no price is present.
     """
+    # Try digit patterns first
     match = re.search(r"\$?(\d+\.\d{2})\b", text)
-    if not match:
+    if match:
+        return float(match.group(1))
+
+    # Word-form number mapping
+    _ONES = {
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+        "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+        "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+        "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+        "eighteen": 18, "nineteen": 19,
+    }
+    _TENS = {
+        "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+        "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    }
+
+    def _word_to_num(word: str) -> Optional[int]:
+        """Convert a single number word or compound like 'twenty eight' to int."""
+        word = word.strip().lower()
+        if word in _ONES:
+            return _ONES[word]
+        if word in _TENS:
+            return _TENS[word]
+        # Try compound: "twenty eight"
+        parts = word.split()
+        if len(parts) == 2 and parts[0] in _TENS and parts[1] in _ONES:
+            return _TENS[parts[0]] + _ONES[parts[1]]
         return None
-    return float(match.group(1))
+
+    def _words_to_price(text_lower: str) -> Optional[float]:
+        """Try to extract a dollars.cents price from word-form numbers in text."""
+        # Tokenize and convert each word to a number
+        words = re.findall(r"[a-z]+", text_lower)
+        nums = []
+        i = 0
+        while i < len(words):
+            # Try two-word compound first (e.g. "twenty eight")
+            if i + 1 < len(words):
+                two_word = words[i] + " " + words[i + 1]
+                val = _word_to_num(two_word)
+                if val is not None:
+                    nums.append(val)
+                    i += 2
+                    continue
+            # Single word
+            val = _word_to_num(words[i])
+            if val is not None:
+                nums.append(val)
+            else:
+                # Non-number word breaks a sequence — if we have nums, try to parse
+                if len(nums) >= 2:
+                    dollars, cents = nums[-2], nums[-1]
+                    if 0 < cents <= 99:
+                        return round(dollars + cents / 100.0, 2)
+                nums = []
+            i += 1
+
+        # Check remaining nums at end of string
+        if len(nums) >= 2:
+            dollars, cents = nums[-2], nums[-1]
+            if 0 < cents <= 99:
+                return round(dollars + cents / 100.0, 2)
+
+        return None
+
+    text_lower = text.lower()
+    result = _words_to_price(text_lower)
+    if result is not None:
+        return result
+
+    # Try single number with "dollars" or "bucks"
+    all_words = list(_ONES.keys()) + list(_TENS.keys())
+    word_pattern = "|".join(sorted(all_words, key=len, reverse=True))
+    compound = rf"(?:(?:{word_pattern})\s+(?:{word_pattern})|(?:{word_pattern}))"
+    single_pattern = rf"({compound})\s+(?:dollars?|bucks?)"
+    m = re.search(single_pattern, text_lower)
+    if m:
+        val = _word_to_num(m.group(1))
+        if val is not None:
+            return float(val)
+
+    return None
