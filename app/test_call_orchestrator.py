@@ -494,91 +494,108 @@ class TestRecordPrice:
 # ------------------------------------------------------------------
 
 class TestMaybeAdvancePhase:
-    def test_greeting_to_delivery_info(self):
+    @pytest.mark.asyncio
+    async def test_greeting_to_delivery_info(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.GREETING
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.DELIVERY_INFO
 
-    def test_delivery_info_to_pizza_order(self):
+    @pytest.mark.asyncio
+    async def test_delivery_info_to_pizza_order(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.DELIVERY_INFO
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.PIZZA_ORDER
 
-    def test_pizza_order_stays_without_price(self):
+    @pytest.mark.asyncio
+    async def test_pizza_order_stays_without_price(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.PIZZA_ORDER
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.PIZZA_ORDER
 
-    def test_pizza_order_to_side_order_with_price(self):
+    @pytest.mark.asyncio
+    async def test_pizza_order_to_side_order_with_price(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.PIZZA_ORDER
         orch.context.pizza_price = 18.99
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.SIDE_ORDER
 
-    def test_side_order_stays_without_price_or_skip(self):
+    @pytest.mark.asyncio
+    async def test_side_order_stays_without_price_or_skip(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.SIDE_ORDER
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.SIDE_ORDER
 
-    def test_side_order_to_drink_with_price(self):
+    @pytest.mark.asyncio
+    async def test_side_order_to_drink_with_price(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.SIDE_ORDER
         orch.context.side_price = 6.50
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.DRINK_ORDER
 
-    def test_side_order_to_drink_when_skipped(self):
+    @pytest.mark.asyncio
+    async def test_side_order_to_drink_when_skipped(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.SIDE_ORDER
         orch.context.side_skipped = True
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.DRINK_ORDER
 
-    def test_drink_order_to_price_collection_with_price(self):
+    @pytest.mark.asyncio
+    async def test_drink_order_to_price_collection_with_price(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.DRINK_ORDER
         orch.context.drink_price = 3.49
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.PRICE_COLLECTION
 
-    def test_drink_order_to_price_collection_when_skipped(self):
+    @pytest.mark.asyncio
+    async def test_drink_order_to_price_collection_when_skipped(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.DRINK_ORDER
         orch.context.drink_skipped = True
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.PRICE_COLLECTION
 
-    def test_price_collection_stays_without_both_fields(self):
+    @pytest.mark.asyncio
+    async def test_price_collection_stays_without_both_fields(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.PRICE_COLLECTION
         orch.context.delivery_time = "30 minutes"
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.PRICE_COLLECTION
 
-    def test_price_collection_to_special_instructions(self):
+    @pytest.mark.asyncio
+    async def test_price_collection_to_special_instructions(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.PRICE_COLLECTION
         orch.context.delivery_time = "30 minutes"
         orch.context.order_number = "1234"
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.SPECIAL_INSTRUCTIONS
 
-    def test_special_instructions_to_closing(self):
+    @pytest.mark.asyncio
+    async def test_special_instructions_to_closing(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.SPECIAL_INSTRUCTIONS
         orch.context.special_instructions_delivered = True
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.CLOSING
+        # Transitioning to CLOSING triggers end_call("completed")
+        assert orch.state == CallState.HANGUP
+        assert orch._call_result is not None
+        assert orch._call_result.outcome == "completed"
 
-    def test_special_instructions_stays_without_delivery(self):
+    @pytest.mark.asyncio
+    async def test_special_instructions_stays_without_delivery(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.SPECIAL_INSTRUCTIONS
-        orch.maybe_advance_phase()
+        await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.SPECIAL_INSTRUCTIONS
 
 
@@ -609,3 +626,114 @@ class TestDrinkBudgetLogic:
         await orch.handle_conversation("The Coke is $3.49")
         assert orch.context.drink_price == 3.49
         assert abs(orch.context.running_total - 33.49) < 0.01
+
+
+# ------------------------------------------------------------------
+# Hangup conditions (task 9.3)
+# ------------------------------------------------------------------
+
+class TestNothingAvailable:
+    @pytest.mark.asyncio
+    async def test_pizza_cant_be_made(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.PIZZA_ORDER
+        await orch.handle_conversation("Sorry, we can't make that")
+        assert orch.state == CallState.HANGUP
+        assert orch._call_result.outcome == "nothing_available"
+
+    @pytest.mark.asyncio
+    async def test_no_pizza_available(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.PIZZA_ORDER
+        await orch.handle_conversation("We don't have pizza right now")
+        assert orch._call_result.outcome == "nothing_available"
+
+    @pytest.mark.asyncio
+    async def test_were_closed(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.PIZZA_ORDER
+        await orch.handle_conversation("Sorry, we're closed")
+        assert orch._call_result.outcome == "nothing_available"
+
+    @pytest.mark.asyncio
+    async def test_normal_pizza_conversation_no_hangup(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.PIZZA_ORDER
+        await orch.handle_conversation("What size pizza do you want?")
+        assert orch.state != CallState.HANGUP
+
+
+class TestOverBudgetPizzaSide:
+    @pytest.mark.asyncio
+    async def test_pizza_price_exceeds_budget(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.PIZZA_ORDER
+        # budget_max is 40.00
+        await orch.handle_conversation("That pizza is $45.00")
+        assert orch.state == CallState.HANGUP
+        assert orch._call_result.outcome == "over_budget"
+
+    @pytest.mark.asyncio
+    async def test_side_price_pushes_over_budget(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.SIDE_ORDER
+        orch.context.pizza_price = 35.00
+        orch.context.running_total = 35.00
+        await orch.handle_conversation("The garlic bread is $8.00")
+        assert orch.state == CallState.HANGUP
+        assert orch._call_result.outcome == "over_budget"
+
+    @pytest.mark.asyncio
+    async def test_pizza_price_within_budget_no_hangup(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.PIZZA_ORDER
+        await orch.handle_conversation("That pizza is $18.99")
+        assert orch.state != CallState.HANGUP
+
+
+class TestCompletedHangup:
+    @pytest.mark.asyncio
+    async def test_closing_triggers_completed(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.SPECIAL_INSTRUCTIONS
+        orch.context.special_instructions_delivered = True
+        await orch.maybe_advance_phase()
+        assert orch.state == CallState.HANGUP
+        assert orch._call_result.outcome == "completed"
+
+
+class TestSpecialInstructionsDelivery:
+    @pytest.mark.asyncio
+    async def test_special_instructions_marked_delivered(self):
+        orch = _make_orchestrator()
+        orch.state = CallState.CONVERSATION
+        orch.conversation_phase = ConversationPhase.SPECIAL_INSTRUCTIONS
+        await orch.handle_conversation("Anything else?")
+        assert orch.context.special_instructions_delivered is True
+
+
+class TestBuildResultDrinkSkipped:
+    def test_drink_skipped_includes_reason(self):
+        orch = _make_orchestrator()
+        orch.context.drink_skipped = True
+        orch.context.drink_skip_reason = "over_budget"
+        result = orch._build_result("completed")
+        assert result.drink is not None
+        assert result.drink["skipped"] is True
+        assert result.drink["reason"] == "over_budget"
+
+    def test_drink_skipped_default_reason(self):
+        orch = _make_orchestrator()
+        orch.context.drink_skipped = True
+        result = orch._build_result("completed")
+        assert result.drink is not None
+        assert result.drink["skipped"] is True
+        assert result.drink["reason"] == "over_budget"

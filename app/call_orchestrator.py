@@ -133,10 +133,36 @@ class CallOrchestrator:
         if price is not None:
             self.record_price(phase, price)
 
+        # --- Over-budget check for pizza + side ---
+        if (
+            price is not None
+            and phase in (ConversationPhase.PIZZA_ORDER, ConversationPhase.SIDE_ORDER)
+            and ctx.running_total > order.budget_max
+        ):
+            await self.end_call("over_budget")
+            return
+
         # --- Phase-specific business logic ---
         response: str | None = None
 
         if phase == ConversationPhase.PIZZA_ORDER:
+            # Check if the pizza itself can't be ordered (core item unavailable)
+            nothing_available_kw = [
+                "we can't make that",
+                "we don't have pizza",
+                "no pizza",
+                "can't do pizza",
+                "don't sell pizza",
+                "we don't make pizza",
+                "not available",
+                "can't make any pizza",
+                "we're closed",
+                "can't do that order",
+            ]
+            if any(kw in text_lower for kw in nothing_available_kw):
+                await self.end_call("nothing_available")
+                return
+
             unavailable_kw = ["out of", "don't have", "unavailable", "we're out"]
             if any(kw in text_lower for kw in unavailable_kw):
                 # Employee says a topping is unavailable — check for offered sub
@@ -171,6 +197,16 @@ class CallOrchestrator:
                             transcript, "All side options unavailable. Skip the side."
                         )
 
+        elif phase == ConversationPhase.SPECIAL_INSTRUCTIONS:
+            # Deliver special instructions and mark as done
+            if not ctx.special_instructions_delivered:
+                response = await self._llm_response(
+                    transcript,
+                    f"Deliver these special instructions: \"{order.special_instructions}\". "
+                    f"Then say thanks and goodbye.",
+                )
+                ctx.special_instructions_delivered = True
+
         elif phase == ConversationPhase.DRINK_ORDER:
             if price is not None:
                 budget_action = evaluate_budget(
@@ -201,7 +237,7 @@ class CallOrchestrator:
         await self.speak(response)
 
         # --- Phase advancement ---
-        self.maybe_advance_phase()
+        await self.maybe_advance_phase()
 
     # ------------------------------------------------------------------
     # LLM helper
@@ -251,7 +287,7 @@ class CallOrchestrator:
     # Phase advancement
     # ------------------------------------------------------------------
 
-    def maybe_advance_phase(self) -> None:
+    async def maybe_advance_phase(self) -> None:
         """Transition to the next conversation phase when conditions are met."""
         phase = self.conversation_phase
         ctx = self.context
@@ -284,6 +320,10 @@ class CallOrchestrator:
         elif phase == ConversationPhase.SPECIAL_INSTRUCTIONS:
             if ctx.special_instructions_delivered:
                 self.conversation_phase = ConversationPhase.CLOSING
+
+        # --- Completed hangup: CLOSING phase reached ---
+        if self.conversation_phase == ConversationPhase.CLOSING:
+            await self.end_call("completed")
 
     # ------------------------------------------------------------------
     # Actions: DTMF, speak, end call
@@ -374,7 +414,10 @@ class CallOrchestrator:
                 "price": ctx.drink_price,
             }
         elif ctx.drink_skipped:
-            drink_data = None  # null with reason in skip_reason
+            drink_data = {
+                "skipped": True,
+                "reason": ctx.drink_skip_reason or "over_budget",
+            }
 
         return CallResult(
             outcome=outcome,
