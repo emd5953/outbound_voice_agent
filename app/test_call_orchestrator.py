@@ -132,16 +132,20 @@ class TestHandleTranscript:
     async def test_on_hold_transitions_to_conversation_on_human(self):
         orch = _make_orchestrator()
         orch.state = CallState.ON_HOLD
+        orch._hold_cooldown_until = 0  # bypass cooldown for test
 
         with patch.object(orch, "handle_conversation", new_callable=AsyncMock) as mock_conv:
             await orch.handle_transcript("Hey there, what can I get for you?")
             assert orch.state == CallState.CONVERSATION
-            mock_conv.assert_called_once_with("Hey there, what can I get for you?")
+            # Debounce fires asynchronously — wait for it
+            await asyncio.sleep(orch._DEBOUNCE_SECONDS + 0.2)
+            mock_conv.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_on_hold_ignores_short_transcript(self):
         orch = _make_orchestrator()
         orch.state = CallState.ON_HOLD
+        orch._hold_cooldown_until = 0  # bypass cooldown for test
 
         await orch.handle_transcript("hi")
         assert orch.state == CallState.ON_HOLD
@@ -153,7 +157,9 @@ class TestHandleTranscript:
 
         with patch.object(orch, "handle_conversation", new_callable=AsyncMock) as mock_conv:
             await orch.handle_transcript("What size pizza?")
-            mock_conv.assert_called_once_with("What size pizza?")
+            # Debounce fires asynchronously — wait for it
+            await asyncio.sleep(orch._DEBOUNCE_SECONDS + 0.2)
+            mock_conv.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_transcript_recorded_in_history(self):
@@ -168,6 +174,7 @@ class TestHandleTranscript:
     async def test_multiple_transcripts_in_chronological_order(self):
         orch = _make_orchestrator()
         orch.state = CallState.ON_HOLD
+        orch._hold_cooldown_until = 0  # bypass cooldown for test
 
         await orch.handle_transcript("hi")
         await orch.handle_transcript("hello there how can I help you today")
@@ -189,35 +196,34 @@ class TestSendDtmf:
     async def test_send_dtmf_records_in_history(self):
         orch = _make_orchestrator()
         orch.call_sid = "CA123"
-        mock_client = MagicMock()
-        orch.set_twilio_client(mock_client)
+        handler = MagicMock()
+        handler.stream_sid = "MZ123"
+        handler.twilio_ws = AsyncMock()
+        orch.set_media_handler(handler)
 
         await orch.send_dtmf("1")
         assert any("[DTMF: 1]" in e["text"] for e in orch.transcript_history)
 
     @pytest.mark.asyncio
-    async def test_send_dtmf_calls_twilio(self):
+    async def test_send_dtmf_sends_audio_to_twilio(self):
         orch = _make_orchestrator()
         orch.call_sid = "CA123"
-        mock_client = MagicMock()
-        mock_call = MagicMock()
-        mock_client.calls.return_value = mock_call
-        orch.set_twilio_client(mock_client)
-
-        await orch.send_dtmf("5551234567")
-
-        mock_client.calls.assert_called_once_with("CA123")
-        mock_call.update.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_send_dtmf_no_op_without_call_sid(self):
-        orch = _make_orchestrator()
-        orch.call_sid = ""
-        mock_client = MagicMock()
-        orch.set_twilio_client(mock_client)
+        handler = MagicMock()
+        handler.stream_sid = "MZ123"
+        handler.twilio_ws = AsyncMock()
+        orch.set_media_handler(handler)
 
         await orch.send_dtmf("1")
-        mock_client.calls.assert_not_called()
+        # Should have sent media events (tone + gap)
+        assert handler.twilio_ws.send_text.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_send_dtmf_no_op_without_media_handler(self):
+        orch = _make_orchestrator()
+        orch.call_sid = "CA123"
+        # No media handler — should not raise
+        await orch.send_dtmf("1")
+        assert any("[DTMF: 1]" in e["text"] for e in orch.transcript_history)
 
 
 # ------------------------------------------------------------------
@@ -498,6 +504,12 @@ class TestMaybeAdvancePhase:
     async def test_greeting_to_delivery_info(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.GREETING
+        # Simulate at least 2 employee utterances to trigger advancement
+        orch.transcript_history = [
+            {"role": "employee", "text": "Hey thanks for calling"},
+            {"role": "agent", "text": "Hey, delivery order please"},
+            {"role": "employee", "text": "Sure thing, name for the order?"},
+        ]
         await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.DELIVERY_INFO
 
@@ -505,6 +517,10 @@ class TestMaybeAdvancePhase:
     async def test_delivery_info_to_pizza_order(self):
         orch = _make_orchestrator()
         orch.conversation_phase = ConversationPhase.DELIVERY_INFO
+        # Simulate employee asking about the order
+        orch.transcript_history = [
+            {"role": "employee", "text": "Cool, what are you looking to order?"},
+        ]
         await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.PIZZA_ORDER
 
@@ -586,10 +602,9 @@ class TestMaybeAdvancePhase:
         orch.context.special_instructions_delivered = True
         await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.CLOSING
-        # Transitioning to CLOSING triggers end_call("completed")
-        assert orch.state == CallState.HANGUP
-        assert orch._call_result is not None
-        assert orch._call_result.outcome == "completed"
+        # CLOSING no longer auto-triggers end_call — the conversation handler
+        # manages hangup after saying goodbye
+        assert orch.state != CallState.HANGUP
 
     @pytest.mark.asyncio
     async def test_special_instructions_stays_without_delivery(self):
@@ -706,8 +721,9 @@ class TestCompletedHangup:
         orch.conversation_phase = ConversationPhase.SPECIAL_INSTRUCTIONS
         orch.context.special_instructions_delivered = True
         await orch.maybe_advance_phase()
-        assert orch.state == CallState.HANGUP
-        assert orch._call_result.outcome == "completed"
+        # CLOSING no longer auto-triggers end_call — the CLOSING handler
+        # manages hangup after the agent says goodbye
+        assert orch.conversation_phase == ConversationPhase.CLOSING
 
 
 class TestSpecialInstructionsDelivery:

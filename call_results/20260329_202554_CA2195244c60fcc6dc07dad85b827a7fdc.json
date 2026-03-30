@@ -1,0 +1,21 @@
+{
+  "outcome": "completed",
+  "pizza": {
+    "description": "",
+    "substitutions": {},
+    "price": 18.5
+  },
+  "side": {
+    "description": "garlic bread",
+    "original_choice": "buffalo wings, 12 count",
+    "price": 6.99
+  },
+  "drink": {
+    "skipped": true,
+    "reason": "over_budget"
+  },
+  "total": 25.490000000000006,
+  "delivery_time": null,
+  "order_number": "1850",
+  "special_instructions_delivered": false
+}

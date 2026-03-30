@@ -134,7 +134,8 @@ class TestBuildSystemPrompt:
         )
         assert "$25.49" in prompt
         assert f"${sample_order.budget_max:.2f}" in prompt
-        assert sample_order.drink.first_choice in prompt
+        # Drink name is TTS-friendly ("two liter" instead of "2L")
+        assert "coke" in prompt.lower()
 
     def test_special_instructions_in_prompt(
         self, engine: ConversationEngine, sample_order: OrderPayload, sample_context: OrderContext

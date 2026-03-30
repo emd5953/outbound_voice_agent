@@ -111,7 +111,40 @@ def detect_hold_end(transcript: str) -> bool:
         "hey there",
         "hi there",
         "what can i do for you",
+        "get started",
+        "ready to order",
+        "go ahead",
+        "hello",
+        "welcome",
     ]
+
+    # IVR / hold phrases to IGNORE (not a human pickup)
+    ignore_patterns = [
+        "please hold",
+        "connect you",
+        "team member",
+        "hold while",
+        "transferring",
+        "one moment",
+        "press 1",
+        "press 2",
+        "press 3",
+        "say the name",
+        "callback number",
+        "zip code",
+        "is that correct",
+        "got it",
+        "say yes",
+        "say no",
+        "start over",
+        "to confirm",
+        "please call back",
+        "try again",
+    ]
+
+    for pattern in ignore_patterns:
+        if pattern in text:
+            return False
 
     for pattern in greeting_patterns:
         if pattern in text:

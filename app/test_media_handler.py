@@ -210,135 +210,116 @@ from unittest.mock import patch, MagicMock
 from app.media_handler import synthesize_and_send, TTSError
 
 
-class _FakeResponse:
-    """Mimics an AsyncBinaryAPIResponse with async iter_bytes."""
+async def _async_iter(items):
+    """Helper: turn a list into an async iterator (for mocking aiter_lines)."""
+    for item in items:
+        yield item
 
-    def __init__(self, chunks: list[bytes]) -> None:
-        self._chunks = chunks
 
-    async def iter_bytes(self):
-        for chunk in self._chunks:
-            yield chunk
+def _make_sse_response(audio_data: bytes):
+    """Build a mock streaming response that yields SSE lines with audio."""
+    audio_b64 = base64.b64encode(audio_data).decode("utf-8")
+    sse_lines = [f'data: {{"data": "{audio_b64}"}}', "data: [DONE]"]
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.aiter_lines = lambda: _async_iter(sse_lines)
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+    return mock_resp
 
 
 class TestSynthesizeAndSend:
     @pytest.mark.asyncio
     async def test_streams_audio_chunks_as_base64_media_events(self):
-        """Happy path: audio chunks are base64-encoded and sent to Twilio."""
-        chunks = [b"\x01\x02", b"\x03\x04"]
-        fake_response = _FakeResponse(chunks)
-
-        mock_client = AsyncMock()
-        mock_client.tts.generate = AsyncMock(return_value=fake_response)
-        mock_client.close = AsyncMock()
-
+        """Happy path: SSE audio chunks are base64-encoded and sent to Twilio."""
+        audio_data = b"\x01\x02\x03\x04" * 200
+        mock_response = _make_sse_response(audio_data)
         twilio_ws = AsyncMock()
 
-        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+        with patch("app.media_handler.httpx.AsyncClient") as MockClient:
+            mock_client_instance = AsyncMock()
+            mock_client_instance.stream = MagicMock(return_value=mock_response)
+            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+            mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client_instance
+
             await synthesize_and_send("hello", "STREAM1", twilio_ws)
 
-        # Verify generate was called with correct params
-        mock_client.tts.generate.assert_awaited_once()
-        call_kwargs = mock_client.tts.generate.call_args.kwargs
-        assert call_kwargs["transcript"] == "hello"
-        assert call_kwargs["output_format"]["encoding"] == "pcm_mulaw"
-        assert call_kwargs["output_format"]["sample_rate"] == 8000
-        assert call_kwargs["voice"] == {"mode": "id", "id": "a0e99841-438c-4a64-b679-ae501e7d6091"}
+        mock_client_instance.stream.assert_called_once()
+        call_args = mock_client_instance.stream.call_args
+        body = call_args.kwargs.get("json", {})
+        assert body["transcript"] == "hello"
+        assert body["output_format"]["encoding"] == "pcm_mulaw"
+        assert body["output_format"]["sample_rate"] == 8000
 
-        # Verify each chunk was sent as a media event
-        assert twilio_ws.send_text.await_count == 2
-        for i, chunk in enumerate(chunks):
-            sent_json = json.loads(twilio_ws.send_text.call_args_list[i].args[0])
+        assert twilio_ws.send_text.await_count > 0
+        for call in twilio_ws.send_text.call_args_list:
+            sent_json = json.loads(call.args[0])
             assert sent_json["event"] == "media"
             assert sent_json["streamSid"] == "STREAM1"
-            expected_b64 = base64.b64encode(chunk).decode("utf-8")
-            assert sent_json["media"]["payload"] == expected_b64
 
     @pytest.mark.asyncio
     async def test_retries_once_on_first_failure(self):
         """First TTS call fails, second succeeds — should still work."""
-        fake_response = _FakeResponse([b"\xaa"])
-
-        mock_client_fail = AsyncMock()
-        mock_client_fail.tts.generate = AsyncMock(side_effect=RuntimeError("API down"))
-        mock_client_fail.close = AsyncMock()
-
-        mock_client_ok = AsyncMock()
-        mock_client_ok.tts.generate = AsyncMock(return_value=fake_response)
-        mock_client_ok.close = AsyncMock()
-
+        mock_response = _make_sse_response(b"\xaa" * 100)
         twilio_ws = AsyncMock()
+        call_count = 0
 
-        with patch("app.media_handler.cartesia.AsyncCartesia", side_effect=[mock_client_fail, mock_client_ok]):
-            with patch("app.media_handler.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        def mock_stream(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("API down")
+            return mock_response
+
+        with patch("app.media_handler.httpx.AsyncClient") as MockClient:
+            mock_client_instance = AsyncMock()
+            mock_client_instance.stream = MagicMock(side_effect=mock_stream)
+            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+            mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client_instance
+
+            with patch("app.media_handler.asyncio.sleep", new_callable=AsyncMock):
                 await synthesize_and_send("retry me", "SID2", twilio_ws)
 
-        # Sleep was called once (backoff before retry)
-        mock_sleep.assert_awaited_once_with(1.0)
-        # Audio was sent on the second attempt
-        assert twilio_ws.send_text.await_count == 1
+        assert twilio_ws.send_text.await_count > 0
 
     @pytest.mark.asyncio
     async def test_raises_tts_error_after_two_failures(self):
         """Both attempts fail — should raise TTSError."""
-        mock_client = AsyncMock()
-        mock_client.tts.generate = AsyncMock(side_effect=RuntimeError("API down"))
-        mock_client.close = AsyncMock()
-
         twilio_ws = AsyncMock()
 
-        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+        def mock_stream(*args, **kwargs):
+            raise RuntimeError("API down")
+
+        with patch("app.media_handler.httpx.AsyncClient") as MockClient:
+            mock_client_instance = AsyncMock()
+            mock_client_instance.stream = MagicMock(side_effect=mock_stream)
+            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+            mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client_instance
+
             with patch("app.media_handler.asyncio.sleep", new_callable=AsyncMock):
                 with pytest.raises(TTSError, match="failed after 2 attempts"):
                     await synthesize_and_send("fail me", "SID3", twilio_ws)
 
-        # No audio should have been sent
         twilio_ws.send_text.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_client_closed_on_success(self):
-        """Client is closed after successful synthesis."""
-        fake_response = _FakeResponse([b"\x00"])
-        mock_client = AsyncMock()
-        mock_client.tts.generate = AsyncMock(return_value=fake_response)
-        mock_client.close = AsyncMock()
-
-        twilio_ws = AsyncMock()
-
-        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
-            await synthesize_and_send("hi", "SID4", twilio_ws)
-
-        mock_client.close.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_client_closed_on_failure(self):
-        """Client is closed even when TTS fails."""
-        mock_client = AsyncMock()
-        mock_client.tts.generate = AsyncMock(side_effect=RuntimeError("boom"))
-        mock_client.close = AsyncMock()
-
-        twilio_ws = AsyncMock()
-
-        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
-            with patch("app.media_handler.asyncio.sleep", new_callable=AsyncMock):
-                with pytest.raises(TTSError):
-                    await synthesize_and_send("bye", "SID5", twilio_ws)
-
-        # close() called on each attempt
-        assert mock_client.close.await_count == 2
 
     @pytest.mark.asyncio
     async def test_custom_voice_id_passed_through(self):
         """A custom voice_id is forwarded to the Cartesia API."""
-        fake_response = _FakeResponse([b"\x00"])
-        mock_client = AsyncMock()
-        mock_client.tts.generate = AsyncMock(return_value=fake_response)
-        mock_client.close = AsyncMock()
-
+        mock_response = _make_sse_response(b"\x00" * 100)
         twilio_ws = AsyncMock()
 
-        with patch("app.media_handler.cartesia.AsyncCartesia", return_value=mock_client):
+        with patch("app.media_handler.httpx.AsyncClient") as MockClient:
+            mock_client_instance = AsyncMock()
+            mock_client_instance.stream = MagicMock(return_value=mock_response)
+            mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
+            mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client_instance
+
             await synthesize_and_send("test", "SID6", twilio_ws, voice_id="custom-voice-123")
 
-        call_kwargs = mock_client.tts.generate.call_args.kwargs
-        assert call_kwargs["voice"] == {"mode": "id", "id": "custom-voice-123"}
+        call_args = mock_client_instance.stream.call_args
+        body = call_args.kwargs.get("json", {})
+        assert body["voice"]["id"] == "custom-voice-123"

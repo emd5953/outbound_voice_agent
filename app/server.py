@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from datetime import datetime
 from typing import Any
 
 import websockets as ws_lib
@@ -39,7 +41,8 @@ active_calls: dict[str, CallOrchestrator] = {}
 DEEPGRAM_WS_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?encoding=mulaw&sample_rate=8000&channels=1"
-    "&model=nova-2&punctuate=true&interim_results=true"
+    "&model=nova-2-phonecall&punctuate=true&interim_results=true"
+    "&endpointing=250&utterance_end_ms=1000"
 )
 
 
@@ -91,6 +94,34 @@ async def place_order(payload: OrderPayload) -> CallResult:
 
     # Wait for the call to complete and return the result
     result = await orchestrator.wait_for_completion()
+
+    # Print the result JSON prominently
+    result_json = result.model_dump_json(indent=2)
+    print(
+        "\n"
+        "============================================\n"
+        "           CALL RESULT\n"
+        "============================================\n"
+        f"{result_json}\n"
+        "============================================"
+    )
+    logger.info(
+        "\n"
+        "============================================\n"
+        "           CALL RESULT\n"
+        "============================================\n"
+        "%s\n"
+        "============================================",
+        result_json,
+    )
+
+    # Save result to file
+    os.makedirs("call_results", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_path = f"call_results/{timestamp}_{call.sid}.json"
+    with open(result_path, "w") as f:
+        f.write(result_json)
+    logger.info("Result saved to %s", result_path)
 
     # Clean up
     active_calls.pop(call.sid, None)

@@ -9,6 +9,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 import cartesia
+import httpx
 
 from config import CARTESIA_API_KEY
 
@@ -156,26 +157,26 @@ async def synthesize_and_send(
     twilio_ws: Any,
     voice_id: str = CARTESIA_VOICE_ID,
 ) -> None:
-    """Synthesize *text* via Cartesia TTS HTTP API and stream audio to Twilio.
+    """Synthesize *text* via Cartesia streaming TTS and forward audio chunks
+    to Twilio as they arrive — no waiting for the full response.
 
-    Uses the Cartesia REST API directly (bypassing the SDK which has Python 3.9
-    compatibility issues) to generate raw pcm_mulaw at 8 kHz, then sends each
-    chunk as a base64-encoded Twilio media event.
+    Uses Cartesia's SSE streaming endpoint so the first audio chunk reaches
+    Twilio within ~150ms instead of waiting for the entire synthesis.
 
     Retry logic:
     - On first TTS failure, retry once after a 1-second backoff.
     - On second failure, raise TTSError.
     """
-    import httpx
-
     max_attempts = 2
     backoff = 1.0
+    chunk_size = 640  # 80ms of mulaw at 8kHz
 
     for attempt in range(1, max_attempts + 1):
         try:
             async with httpx.AsyncClient(timeout=30.0) as http_client:
-                response = await http_client.post(
-                    "https://api.cartesia.ai/tts/bytes",
+                async with http_client.stream(
+                    "POST",
+                    "https://api.cartesia.ai/tts/sse",
                     headers={
                         "X-API-Key": CARTESIA_API_KEY,
                         "Cartesia-Version": "2024-06-10",
@@ -191,23 +192,59 @@ async def synthesize_and_send(
                             "sample_rate": 8000,
                         },
                     },
-                )
-                response.raise_for_status()
+                ) as response:
+                    response.raise_for_status()
 
-                audio_bytes = response.content
-                # Send in chunks to avoid huge single frames
-                chunk_size = 640  # 80ms of mulaw at 8kHz
-                for i in range(0, len(audio_bytes), chunk_size):
-                    chunk = audio_bytes[i : i + chunk_size]
-                    audio_b64 = base64.b64encode(chunk).decode("utf-8")
-                    media_event = json.dumps(
-                        {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": audio_b64},
-                        }
-                    )
-                    await twilio_ws.send_text(media_event)
+                    # Buffer for partial chunks across SSE events
+                    audio_buffer = bytearray()
+
+                    async for line in response.aiter_lines():
+                        # SSE format: "data: <json>" lines
+                        if not line.startswith("data:"):
+                            continue
+
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+
+                        try:
+                            event = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+
+                        audio_b64_chunk = event.get("data")
+                        if not audio_b64_chunk:
+                            continue
+
+                        audio_buffer.extend(base64.b64decode(audio_b64_chunk))
+
+                        # Forward complete chunks to Twilio immediately
+                        while len(audio_buffer) >= chunk_size:
+                            chunk = bytes(audio_buffer[:chunk_size])
+                            del audio_buffer[:chunk_size]
+                            media_event = json.dumps(
+                                {
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {
+                                        "payload": base64.b64encode(chunk).decode("utf-8")
+                                    },
+                                }
+                            )
+                            await twilio_ws.send_text(media_event)
+
+                    # Flush any remaining audio in the buffer
+                    if audio_buffer:
+                        media_event = json.dumps(
+                            {
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {
+                                    "payload": base64.b64encode(bytes(audio_buffer)).decode("utf-8")
+                                },
+                            }
+                        )
+                        await twilio_ws.send_text(media_event)
 
             return
 

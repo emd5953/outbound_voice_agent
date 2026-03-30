@@ -160,7 +160,7 @@ class TestDetectHoldEnd:
 
     # 3 or fewer words (>= 5 chars) without greeting pattern
     def test_three_words_no_greeting_returns_false(self):
-        assert detect_hold_end("hello there friend") is False
+        assert detect_hold_end("yeah sure okay") is False
 
     def test_single_long_word_returns_false(self):
         assert detect_hold_end("mmhmm yeah") is False

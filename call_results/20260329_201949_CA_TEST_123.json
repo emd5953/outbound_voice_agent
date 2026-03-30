@@ -1,0 +1,21 @@
+{
+  "outcome": "completed",
+  "pizza": {
+    "description": "large thin crust w/ pepperoni, mushroom, green pepper",
+    "substitutions": {},
+    "price": 18.5
+  },
+  "side": {
+    "description": "buffalo wings",
+    "original_choice": "",
+    "price": 8.99
+  },
+  "drink": {
+    "description": "2L Coke",
+    "price": 3.49
+  },
+  "total": 30.98,
+  "delivery_time": "35-40 minutes",
+  "order_number": "4412",
+  "special_instructions_delivered": true
+}

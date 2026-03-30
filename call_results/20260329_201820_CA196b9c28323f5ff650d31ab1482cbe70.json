@@ -1,0 +1,10 @@
+{
+  "outcome": "ivr_failure",
+  "pizza": null,
+  "side": null,
+  "drink": null,
+  "total": null,
+  "delivery_time": null,
+  "order_number": null,
+  "special_instructions_delivered": false
+}

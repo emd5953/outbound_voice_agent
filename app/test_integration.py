@@ -112,8 +112,9 @@ class TestIVRIntegration:
         # Prompt 4: Zip code
         await orch.handle_transcript("Please say your delivery zip code.")
         assert orch.state == CallState.IVR_CONFIRM
+        # Zip gets TTS-normalized to spoken digits
         assert any(
-            e["text"] == "78745" and e["role"] == "agent"
+            "seven eight seven four five" in e["text"] and e["role"] == "agent"
             for e in orch.transcript_history
         )
 
@@ -164,6 +165,7 @@ class TestHoldToConversationIntegration:
     async def test_hold_ignores_short_then_detects_human(self):
         orch = _make_orchestrator()
         orch.state = CallState.ON_HOLD
+        orch._hold_cooldown_until = 0  # bypass cooldown for test
 
         # Short noise — should stay on hold
         await orch.handle_transcript("mm")
@@ -192,11 +194,11 @@ class TestConversationIntegration:
         engine.generate_response = AsyncMock(return_value="Sure thing.")
         orch.set_conversation_engine(engine)
 
-        # Greeting → Delivery Info → Pizza Order
-        await orch.handle_conversation("What can I get for you?")
+        # Greeting → Delivery Info (1 employee utterance without order keywords)
+        await orch.handle_conversation("Hey thanks for calling")
         assert orch.conversation_phase == ConversationPhase.DELIVERY_INFO
 
-        await orch.handle_conversation("Name for the order?")
+        await orch.handle_conversation("What can I get for you?")
         assert orch.conversation_phase == ConversationPhase.PIZZA_ORDER
 
         # Pizza price received → Side Order
@@ -220,9 +222,12 @@ class TestConversationIntegration:
         await orch.maybe_advance_phase()
         assert orch.conversation_phase == ConversationPhase.SPECIAL_INSTRUCTIONS
 
-        # Special instructions delivered → Closing → completed
+        # Special instructions delivered
         await orch.handle_conversation("Anything else?")
         assert orch.context.special_instructions_delivered is True
+
+        # Employee acknowledges → agent says bye and hangs up
+        await orch.handle_conversation("Got it, no problem.")
         assert orch.state == CallState.HANGUP
         assert orch._call_result.outcome == "completed"
 
@@ -393,7 +398,16 @@ class TestPlaceOrderEndpoint:
         mock_twilio.calls.create.return_value = mock_call
 
         async def fake_wait():
-            return CallResult(outcome="completed")
+            return CallResult(
+                outcome="completed",
+                pizza={"description": "large thin crust w/ pepperoni, mushroom, green pepper", "substitutions": {}, "price": 18.50},
+                side={"description": "buffalo wings", "original_choice": "", "price": 8.99},
+                drink={"description": "2L Coke", "price": 3.49},
+                total=30.98,
+                delivery_time="35-40 minutes",
+                order_number="4412",
+                special_instructions_delivered=True,
+            )
 
         with patch("app.server.TwilioClient", return_value=mock_twilio):
             with patch.object(
@@ -408,6 +422,8 @@ class TestPlaceOrderEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert data["outcome"] == "completed"
+        assert data["pizza"] is not None
+        assert data["total"] == 30.98
 
     @pytest.mark.asyncio
     async def test_invalid_phone_number_returns_422(self):

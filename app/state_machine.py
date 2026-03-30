@@ -71,7 +71,10 @@ async def handle_ivr_transcript(
     # Deepgram may transcribe digits as words ("one" not "1") and may
     # split a single IVR prompt across multiple transcript chunks.
     if state == CallState.IVR_WELCOME:
-        if ("press 1" in text or "press one" in text) and "delivery" in text:
+        # IVR may split "Thanks for calling, press 1 for delivery" across
+        # multiple transcript chunks. Match broadly on "press 1/one" alone
+        # since that's the action we need to take regardless.
+        if "press 1" in text or "press one" in text:
             await orchestrator.send_dtmf("1")
             orchestrator.state = CallState.IVR_NAME
         elif "delivery" in text and ("1" in text or "one" in text):
@@ -95,6 +98,13 @@ async def handle_ivr_transcript(
             orchestrator.state = CallState.IVR_CONFIRM
 
     elif state == CallState.IVR_CONFIRM:
-        if "correct" in text or "is that right" in text:
+        if "correct" in text or "is that right" in text or "confirm" in text:
+            import asyncio
+            await asyncio.sleep(0.5)
             await orchestrator.speak("yes")
             orchestrator.state = CallState.ON_HOLD
+            import time
+            orchestrator._hold_cooldown_until = time.monotonic() + 1.5
+        elif "incorrect" in text or "wrong" in text or "start over" in text or "try again" in text:
+            # IVR rejected our info — restart from name
+            orchestrator.state = CallState.IVR_NAME
